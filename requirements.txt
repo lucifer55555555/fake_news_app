@@ -1,0 +1,7 @@
+streamlit>=1.36
+pandas
+numpy
+nltk
+torch
+transformers
+tensorflow
