@@ -5,13 +5,15 @@ Loads the models trained in the Colab notebook (BERT, LSTM, GRU) and classifies 
 Expected folder layout (default: ./saved_models):
     saved_models/
         bert_model/            <- BERT weights + tokenizer (save_pretrained output)
-        lstm_model.keras
-        gru_model.keras
-        keras_tokenizer.pkl
+        lstm_model.pt
+        gru_model.pt
+        vocab.pkl
+        config.json
 Any model that is missing is simply hidden from the sidebar.
 """
 import os
 import re
+import json
 import pickle
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import torch
+import torch.nn as nn
 
 # ----------------------------------------------------------------------------
 # Config
@@ -75,12 +79,40 @@ def discover_models(model_dir: str) -> dict:
     found = {}
     if (d / "bert_model" / "config.json").exists():
         found["BERT"] = d / "bert_model"
-    tok_ok = (d / "keras_tokenizer.pkl").exists()
-    if tok_ok and (d / "lstm_model.keras").exists():
-        found["LSTM"] = d / "lstm_model.keras"
-    if tok_ok and (d / "gru_model.keras").exists():
-        found["GRU"] = d / "gru_model.keras"
+    if (d / "vocab.pkl").exists():
+        for name in ("LSTM", "GRU"):
+            f = d / f"{name.lower()}_model.pt"
+            if f.exists():
+                found[name] = f
     return found
+
+
+def read_config(model_dir: str):
+    f = Path(model_dir) / "config.json"
+    if f.exists():
+        cfg = json.loads(f.read_text())
+        return int(cfg.get("max_len", MAX_LEN)), int(cfg.get("bert_max_len", BERT_MAX_LEN))
+    return MAX_LEN, BERT_MAX_LEN
+
+
+class RNNClassifier(nn.Module):
+    """Same architecture as the training notebook (embedding weights come from the checkpoint)."""
+    def __init__(self, vocab_size, embed_dim, rnn_type="lstm", hidden=64, dropout=0.4):
+        super().__init__()
+        self.rnn_type = rnn_type
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        rnn_cls = nn.LSTM if rnn_type == "lstm" else nn.GRU
+        self.rnn = rnn_cls(embed_dim, hidden, num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
+        self.head = nn.Sequential(nn.Linear(hidden * 2, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 1))
+
+    def forward(self, x, lengths):
+        emb = self.embedding(x)
+        packed = nn.utils.rnn.pack_padded_sequence(emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        _, h = self.rnn(packed)
+        if self.rnn_type == "lstm":
+            h = h[0]
+        last = torch.cat([h[-2], h[-1]], dim=1)
+        return self.head(last).squeeze(1)
 
 
 @st.cache_resource(show_spinner="Loading BERT model…")
@@ -94,41 +126,43 @@ def load_bert(path: str):
     return tokenizer, model, device
 
 
-@st.cache_resource(show_spinner="Loading Keras model…")
-def load_keras(model_path: str, tokenizer_path: str):
-    from tensorflow.keras.models import load_model
-    from tensorflow.keras.preprocessing.text import Tokenizer  # noqa: F401 (needed to unpickle)
-    model = load_model(model_path)
-    with open(tokenizer_path, "rb") as f:
-        tokenizer = pickle.load(f)
-    return model, tokenizer
+@st.cache_resource(show_spinner="Loading model…")
+def load_rnn(model_path: str, vocab_path: str):
+    ckpt = torch.load(model_path, map_location="cpu")
+    model = RNNClassifier(ckpt["vocab_size"], ckpt["embed_dim"], ckpt["rnn_type"], ckpt.get("hidden", 64))
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    with open(vocab_path, "rb") as f:
+        word_index = pickle.load(f)
+    return model, word_index
 
 
 # ----------------------------------------------------------------------------
 # Prediction — every function returns P(fake) in [0, 1]
 # ----------------------------------------------------------------------------
-def predict_bert(text: str, path) -> float:
-    import torch
+def predict_bert(text: str, path, max_len: int) -> float:
     tokenizer, model, device = load_bert(str(path))
     enc = tokenizer(text, truncation=True, padding="max_length",
-                    max_length=BERT_MAX_LEN, return_tensors="pt").to(device)
+                    max_length=max_len, return_tensors="pt").to(device)
     with torch.no_grad():
         logits = model(**enc).logits
     return float(torch.softmax(logits, dim=1)[0, 1].item())
 
 
-def predict_keras(text: str, model_path, tokenizer_path) -> float:
-    model, tokenizer = load_keras(str(model_path), str(tokenizer_path))
-    seq = tokenizer.texts_to_sequences([clean_text(text)])[0][:MAX_LEN]
-    padded = np.zeros((1, MAX_LEN), dtype="int32")      # post-padding, like training
-    padded[0, : len(seq)] = seq
-    return float(model.predict(padded, verbose=0).ravel()[0])
+def predict_rnn(text: str, model_path, vocab_path, max_len: int) -> float:
+    model, word_index = load_rnn(str(model_path), str(vocab_path))
+    ids = [word_index.get(w, 1) for w in clean_text(text).split()][:max_len] or [1]
+    x = torch.zeros((1, max_len), dtype=torch.long)
+    x[0, : len(ids)] = torch.tensor(ids)
+    with torch.no_grad():
+        return float(torch.sigmoid(model(x, torch.tensor([len(ids)]))).item())
 
 
 def run_model(name: str, text: str, models: dict, model_dir: str) -> float:
+    max_len, bert_max_len = read_config(model_dir)
     if name == "BERT":
-        return predict_bert(text, models["BERT"])
-    return predict_keras(text, models[name], Path(model_dir) / "keras_tokenizer.pkl")
+        return predict_bert(text, models["BERT"], bert_max_len)
+    return predict_rnn(text, models[name], Path(model_dir) / "vocab.pkl", max_len)
 
 
 # ----------------------------------------------------------------------------
