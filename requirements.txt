@@ -4,4 +4,3 @@ numpy
 nltk
 torch
 transformers
-tensorflow
